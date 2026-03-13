@@ -231,24 +231,31 @@ chown buildkite-agent:buildkite-agent "${HOOKS_DIR}/environment"
 
 ## Step 5: Pipeline Design
 
-### Feature Branches: Validate Only
+### Use Dynamic Pipeline Upload (Not `if:` Conditions)
 
-Don't deploy from feature branches unless your project specifically needs it. Run validation instead:
+**Gotcha: `if:` conditions show "broken" steps.** If you use `if:` to conditionally skip steps (e.g., `if: "build.branch == 'main'"`), steps where the condition evaluates to false show as **"broken"** in the Buildkite UI — not "skipped". This makes passing builds look like failures, which is confusing and can trigger false alerts.
+
+**Fix:** Use a setup step that dynamically uploads only the relevant pipeline steps based on the branch. This way skipped steps never appear at all.
 
 ```yaml
-# .buildkite/pipeline.yml
+# .buildkite/pipeline.yml — bootstrap only
 steps:
-  # Feature branch: config validation only
-  - label: ":white_check_mark: Validate"
-    command: ".buildkite/scripts/validate-configs.sh"
-    if: "build.branch != 'main'"
+  - label: ":pipeline: Setup pipeline"
+    command: ".buildkite/scripts/setup-pipeline.sh"
     agents:
       queue: "gcp"
+```
 
-  # Main branch: full deploy pipeline
+```bash
+#!/bin/bash
+# .buildkite/scripts/setup-pipeline.sh
+set -euo pipefail
+
+if [ "${BUILDKITE_BRANCH}" = "main" ]; then
+  cat <<'PIPELINE' | buildkite-agent pipeline upload
+steps:
   - label: ":rocket: Deploy"
     command: ".buildkite/scripts/deploy.sh"
-    if: "build.branch == 'main'"
     agents:
       queue: "gcp"
     retry:
@@ -260,7 +267,6 @@ steps:
 
   - label: ":mag: Validate"
     command: ".buildkite/scripts/validate.sh"
-    if: "build.branch == 'main'"
     agents:
       queue: "gcp"
     timeout_in_minutes: 10
@@ -270,10 +276,24 @@ steps:
 
   - label: ":rotating_light: Rollback"
     command: ".buildkite/scripts/rollback.sh"
-    if: "build.branch == 'main' && build.state == 'failing'"
+    if: "build.state == 'failing'"
     agents:
       queue: "gcp"
+PIPELINE
+
+else
+  cat <<'PIPELINE' | buildkite-agent pipeline upload
+steps:
+  - label: ":white_check_mark: Validate configs"
+    command: ".buildkite/scripts/validate-configs.sh"
+    agents:
+      queue: "gcp"
+PIPELINE
+
+fi
 ```
+
+Note: the Rollback step still uses `if: "build.state == 'failing'"` — this is fine because it only appears on main builds where it's always relevant. It will show as "broken" only if the deploy passes (which is the expected outcome), but since it's a rollback step, seeing it dimmed is less confusing than seeing "Validate configs: broken" on a main branch deploy.
 
 **Gotcha: `branches` and `if` conflict.** Buildkite rejects steps that have both `branches:` and `if:`. Use only `if:` for conditional logic.
 
@@ -743,6 +763,7 @@ Before your first build:
 | Buildkite commit status missing | Pipeline passes but nothing shows on GitHub | Install GitHub App + recreate pipeline (webhook provider won't post statuses) |
 | Pipeline API: cluster required | `Cluster must be specified` error | Include `cluster_id` in API request body |
 | Hook missing after scale-to-zero | `SSH_USER: unbound variable` | Deploy hook via GCS bucket + startup script |
+| `if:` conditions on skipped steps | Steps show as "broken" not "skipped" in UI | Use dynamic pipeline upload — only upload relevant steps per branch |
 | `branches` + `if` in pipeline YAML | Pipeline upload rejected | Use only `if:` expressions |
 | Agent VMs missing tools | `rsync: command not found` | Install in script or custom image |
 | `nc` not available on GCP agents | Port checks fail | Use `curl` instead of `nc -zv` |
