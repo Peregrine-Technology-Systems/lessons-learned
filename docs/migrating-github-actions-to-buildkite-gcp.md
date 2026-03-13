@@ -768,6 +768,7 @@ Before your first build:
 | Agent VMs missing tools | `rsync: command not found` | Install in script or custom image |
 | `nc` not available on GCP agents | Port checks fail | Use `curl` instead of `nc -zv` |
 | HTTP 302 treated as failure | Validation rejects valid redirects | Accept 200, 301, 302, 404, 502, 503 |
+| Webhook dead after pipeline recreate | Pushes don't trigger builds | Update GitHub webhook URL to match new pipeline's `provider.webhook_url` |
 | Terraform variable name collision | Conflicting agent token values | Don't name vars same as module internals |
 | Terraform zones null | `length()` validation failure | Pass explicit zones list |
 | Terraform phased apply needed | Count dependencies on apply-time values | Apply secrets, then IAM, then full |
