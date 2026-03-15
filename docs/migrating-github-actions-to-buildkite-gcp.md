@@ -74,9 +74,18 @@ echo '{"ssh_user":"root","server_host":"x.x.x.x"}' | \
   gcloud secrets create deploy-target-myapp --data-file=-
 
 # GitHub deploy key (for cloning private repos)
+# IMPORTANT: GitHub requires a SEPARATE deploy key per repo.
+# Name each key uniquely in Secret Manager:
 gcloud secrets create github-deploy-key \
-  --data-file=/path/to/github_deploy_key
+  --data-file=/path/to/github_deploy_key_repo1
+gcloud secrets create github-deploy-key-myapp \
+  --data-file=/path/to/github_deploy_key_repo2
 ```
+
+**Gotcha: Per-repo deploy keys.** GitHub doesn't allow the same SSH deploy key on
+multiple repositories. You'll get `key is already in use` if you try. Create a separate
+ed25519 key for each repo, store each in GCP Secret Manager with a unique name, and
+select the right one in the environment hook based on `$BUILDKITE_PIPELINE_SLUG`.
 
 **Gotcha: Trailing newlines matter.** When `gcloud secrets versions access` writes a key to a file, it preserves the exact bytes. If your key was stored without a trailing newline, OpenSSH will reject it with `error in libcrypto`. Always append a newline after writing:
 
@@ -228,6 +237,72 @@ chown buildkite-agent:buildkite-agent "${HOOKS_DIR}/environment"
 2. **Bake into a custom GCE image** — build with Packer, set as the instance template image. Faster cold starts but requires image rebuilds to update hooks.
 
 3. **Deploy manually to each VM** — quick for testing but **does not survive scaling**. When VMs are destroyed and recreated (scale-to-zero), the hook is gone.
+
+### Hook Self-Refresh for Warm VMs
+
+The GCS + startup script approach only runs on VM boot. If a VM stays warm across multiple builds (common during bursts), it runs the stale hook baked into the image or fetched at boot. To fix this, the hook self-refreshes from GCS on every job:
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+# Download and source the latest hook from GCS. The guard variable
+# prevents infinite recursion — the sourced copy sees it's already
+# running from GCS and skips the download.
+_HOOK_FROM_GCS="/tmp/environment-hook-gcs"
+if [ -z "${_HOOK_SOURCED_FROM_GCS:-}" ]; then
+  if gsutil -q cp "gs://my-ci-runners-agent-hooks/hooks/environment" "$_HOOK_FROM_GCS" 2>/dev/null; then
+    export _HOOK_SOURCED_FROM_GCS=1
+    source "$_HOOK_FROM_GCS"
+    rm -f "$_HOOK_FROM_GCS"
+    return 0 2>/dev/null || exit 0
+  fi
+fi
+rm -f "$_HOOK_FROM_GCS" 2>/dev/null || true
+
+# ... rest of hook (SSH setup, secrets, etc.) ...
+```
+
+**Why `source` and not `exec`?** Buildkite's agent captures environment variables set during the hook by reading the process's environment after it exits. `exec` replaces the process entirely — any `export` statements in the new script run in a fresh process that the agent never reads back. `source` runs inline in the same shell, so exports are visible to the agent.
+
+### Self-Service Pipeline Secrets (Auto-Discovery)
+
+Instead of editing the environment hook for every new secret, use a naming convention that the hook auto-discovers:
+
+```bash
+inject_pipeline_secrets() {
+  local slug="$1"
+  local secrets
+  secrets=$(gcloud secrets list --filter="name:${slug}--" \
+    --format="value(name)" --project=my-ci-runners 2>/dev/null) || return 0
+
+  for secret_name in $secrets; do
+    # Strip prefix: "my-pipeline--api-key" → "api-key"
+    env_name="${secret_name#*--}"
+    # Uppercase + dashes to underscores: "api-key" → "API_KEY"
+    env_name=$(echo "$env_name" | tr '[:lower:]-' '[:upper:]_')
+    value=$(gcloud secrets versions access latest --secret="$secret_name" 2>/dev/null) || continue
+    export "$env_name"="$value"
+  done
+}
+
+inject_pipeline_secrets "${BUILDKITE_PIPELINE_SLUG}"
+```
+
+To add a secret, project teams just:
+
+```bash
+# 1. Create with naming convention: {pipeline-slug}--{secret-name}
+echo -n "value" | gcloud secrets create my-pipeline--api-key \
+  --data-file=- --project=my-ci-runners
+
+# 2. Grant agent access
+gcloud secrets add-iam-policy-binding my-pipeline--api-key \
+  --member="serviceAccount:buildkite-agent@my-ci-runners.iam.gserviceaccount.com" \
+  --role="roles/secretmanager.secretAccessor" --project=my-ci-runners
+```
+
+**Gotcha: `secretmanager.secretAccessor` doesn't include `secrets.list`.** The agent service account also needs `roles/secretmanager.viewer` at the project level so `gcloud secrets list --filter=...` works. Without it, the auto-discovery silently finds nothing.
 
 ## Step 5: Pipeline Design
 
@@ -484,6 +559,23 @@ Run Buildkite alongside GitHub Actions before cutting over:
 
 This lets you validate the entire pipeline without risk. When both consistently pass, switch branch protection to require Buildkite checks instead.
 
+### Cutover Strategy: One Environment at a Time
+
+**Never deploy to the same environment from both systems simultaneously.** The deploy itself may be idempotent (rsync same commit = same result), but version tagging is not — both systems trying to create `v1.2.3` will cause the second to fail.
+
+| Phase | Buildkite | GitHub Actions | Tags/Releases |
+|-------|-----------|----------------|---------------|
+| **1. CI shadow** | CI checks only | CI + deploy all envs | GHA |
+| **2. Dev deploy** | CI + deploy dev | CI + deploy staging + prod | GHA |
+| **3. Staging deploy** | CI + deploy dev + staging | Deploy prod only | GHA |
+| **4. Full cutover** | CI + deploy all envs | Archived | Buildkite |
+
+Key rules:
+- **Tags/releases stay with GitHub Actions** until full cutover (Phase 4)
+- Cut over one environment at a time — verify, then proceed
+- Keep GHA workflows intact (just disable deploy steps) so you can roll back
+- Update branch protection to require Buildkite checks only after Phase 4
+
 ### GitHub Commit Status Integration
 
 For Buildkite build results to appear on GitHub commits alongside GitHub Actions checks, you need the **Buildkite GitHub App** installed — not just the webhook.
@@ -716,6 +808,101 @@ Even at 1,000 builds/month, it's under $3.
 
 **Without the custom scaler:** If you skip the scale-to-zero fix and set `min_size=1`, the always-on VM costs ~$49/month (on-demand) or ~$21/month (spot). With 3 agents always running (as the default module configures), that's ~$147/month — all for idle VMs.
 
+## How to Add a New Secret to Buildkite Pipelines
+
+### Self-service (recommended): naming convention
+
+Secrets named `{pipeline-slug}--{secret-name}` are auto-discovered and exported as uppercase env vars on deploy steps. No hook changes needed.
+
+```bash
+# 1. Create with naming convention
+echo -n "your-secret-value" | gcloud secrets create \
+  my-pipeline--my-api-key --data-file=- --project=ci-runners-de
+
+# 2. Grant agent access
+gcloud secrets add-iam-policy-binding my-pipeline--my-api-key \
+  --member="serviceAccount:buildkite-agent@ci-runners-de.iam.gserviceaccount.com" \
+  --role="roles/secretmanager.secretAccessor" --project=ci-runners-de
+```
+
+Result: `MY_API_KEY` is available as an env var on deploy/health/smoke steps. Dashes become underscores, uppercased.
+
+### Manual method (for special cases)
+
+If you need secrets on CI steps (not just deploy), or need custom parsing (JSON blobs, SSH keys), edit the environment hook directly:
+
+### 1. Store the secret in GCP Secret Manager
+
+```bash
+# For a simple value:
+echo -n "your-secret-value" | gcloud secrets create my-new-secret \
+  --data-file=- --project=ci-runners-de
+
+# For a file (SSH key, certificate):
+gcloud secrets create my-new-key \
+  --data-file=path/to/keyfile --project=ci-runners-de
+
+# To update an existing secret:
+echo -n "new-value" | gcloud secrets versions add my-new-secret \
+  --data-file=- --project=ci-runners-de
+```
+
+### 2. Grant the agent service account access
+
+```bash
+gcloud secrets add-iam-policy-binding my-new-secret \
+  --member="serviceAccount:buildkite-agent@ci-runners-de.iam.gserviceaccount.com" \
+  --role="roles/secretmanager.secretAccessor" \
+  --project=ci-runners-de
+```
+
+Or add it to Terraform (`terraform/secrets.tf`) for infrastructure-as-code:
+
+```hcl
+resource "google_secret_manager_secret_iam_member" "my_new_secret" {
+  secret_id = "my-new-secret"
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.buildkite_agent.email}"
+}
+```
+
+### 3. Inject it in the environment hook
+
+Edit `agent/hooks/environment` and add the export inside the relevant pipeline's `case` block:
+
+```bash
+case "${BUILDKITE_PIPELINE_SLUG}" in
+  uscgaux-website-checker)
+    # ... existing secrets ...
+    export MY_NEW_SECRET=$(gcloud secrets versions access latest --secret="my-new-secret")
+    ;;
+esac
+```
+
+Then deploy the hook:
+
+```bash
+# Upload to GCS (agents download on startup)
+gsutil cp agent/hooks/environment gs://ci-runners-de-agent-hooks/hooks/environment
+
+# IMPORTANT: commit to git immediately — never leave GCS and git out of sync
+git add agent/hooks/environment
+git commit -m "chore: add MY_NEW_SECRET to environment hook"
+git push origin main
+```
+
+### Quick reference
+
+| Task | Command |
+|------|---------|
+| List all secrets | `gcloud secrets list --project=ci-runners-de` |
+| View a secret | `gcloud secrets versions access latest --secret=NAME --project=ci-runners-de` |
+| Update a secret | `echo -n "value" \| gcloud secrets versions add NAME --data-file=- --project=ci-runners-de` |
+| Check IAM bindings | `gcloud secrets get-iam-policy NAME --project=ci-runners-de` |
+| Test from agent's perspective | SSH into a running VM and run the `gcloud secrets` command as the agent user |
+
+**Remember:** Secrets with SSH keys need a trailing newline — always `echo "" >>` after writing to file. See the Gotchas section.
+
 ## Checklist
 
 Before your first build:
@@ -772,3 +959,17 @@ Before your first build:
 | Terraform variable name collision | Conflicting agent token values | Don't name vars same as module internals |
 | Terraform zones null | `length()` validation failure | Pass explicit zones list |
 | Terraform phased apply needed | Count dependencies on apply-time values | Apply secrets, then IAM, then full |
+| GitHub deploy key per-repo | `Repository not found` on clone (exit 128) | Create separate deploy key per repo, select in environment hook by pipeline slug |
+| Pipeline API `configuration` vs `steps` | Builds created with 0 jobs (`not_run`) | Set `configuration` (YAML string) — `steps` array is ignored as source of truth |
+| Buildkite job state `platform_limited` | Scaler doesn't see queued jobs, MIG underscales | Check `scheduled`, `limited`, `platform_limited`, `limiting`, `platform_limiting` — Buildkite uses multiple state strings for "waiting on agent" |
+| MIG `resize` kills busy VMs | Running build terminated mid-job (exit -1) | Use `deleteInstances` API targeting only idle VMs (cross-reference agent names with Buildkite running jobs) |
+| rsync exit code 23 | Deploy fails on transient file rename race | Add `rsync_retry` wrapper that retries once on exit 23 |
+| npm ECONNRESET (exit 152) | `npm ci` fails through Cloud NAT | Add `exit_status: 152` to Buildkite retry blocks — transient network issue |
+| tar+ssh slower than rsync | Deploy takes 15-20s longer | Stick with rsync — compression overhead outweighs round-trip savings over Cloud NAT |
+| `Closes #N` on non-default branch | Issues stay open after PR merge to develop | Close manually: `gh issue close N --comment "Resolved by PR #X"` |
+| `exec` in environment hook | Buildkite loses env vars set by hook | Use `source` + `_HOOK_SOURCED_FROM_GCS` guard variable — `exec` replaces the process so exports never reach the agent |
+| `secretmanager.secretAccessor` only | `PERMISSION_DENIED` on `gcloud secrets list` | Agent also needs `roles/secretmanager.viewer` — accessor grants `versions.access` but not `secrets.list` |
+| Self-service secrets not injected | New pipeline secret not exported as env var | Name must match `{pipeline-slug}--{secret-name}` convention AND agent SA needs `secretAccessor` on that secret |
+| Hook stale on warm VMs | Updated hook not picked up until scale-to-zero | Self-refresh pattern: hook downloads latest from GCS on every job via `source`, guarded by `_HOOK_SOURCED_FROM_GCS` to prevent infinite loop |
+| `pre-environment` is not a valid hook | Agent ignores the hook file silently | Buildkite agent only supports `environment`, `pre-command`, `post-command`, etc. — self-refresh must happen inside `environment` hook itself |
+| Terraform apply doesn't deploy scaler | Cloud Function code unchanged after `git push` | `terraform apply` required — it zips `cloud-functions/scaler/`, uploads to GCS, and redeploys the function. Git push alone does nothing. |
