@@ -808,6 +808,40 @@ Even at 1,000 builds/month, it's under $3.
 
 **Without the custom scaler:** If you skip the scale-to-zero fix and set `min_size=1`, the always-on VM costs ~$49/month (on-demand) or ~$21/month (spot). With 3 agents always running (as the default module configures), that's ~$147/month — all for idle VMs.
 
+### At Scale: 500+ Builds/Month
+
+At high velocity (~520 builds/month with CI + deploy, 5-minute average on n2d-standard-4 spot):
+
+| Component | Monthly Cost |
+|-----------|-------------|
+| GCP Compute (spot, scale-to-zero) | ~$18 |
+| GCP Secret Manager | ~$0.03 |
+| Cloud Function + Scheduler + GCS | $0.00 (free tier) |
+| Buildkite (Developer plan) | $0.00 |
+| **Total** | **~$18** |
+
+With staging and production deploys also on Buildkite (full cutover), add ~30% more build minutes: **~$24/month**.
+
+### Compared to GitHub Actions
+
+| | GitHub Actions (Team) | Buildkite + GCP |
+|---|---|---|
+| **Plan cost** | $4/user/month | $0 (Developer plan) |
+| **Included minutes** | 3,000 Linux min/month | N/A (your infra) |
+| **Overage** | $0.008/min | ~$0.035/build (~5 min spot) |
+| **500 builds/month** | Free (within included) | ~$18 |
+| **Secrets** | GitHub-managed | GCP Secret Manager (IAM, audit log) |
+| **Runner infra** | GitHub-managed (opaque) | Your GCP VMs (full control) |
+| **Scale to zero** | N/A | Yes — $0 when idle |
+
+At low volume, GitHub Actions is cheaper on pure compute. The case for Buildkite + GCP is:
+
+1. **Infrastructure ownership** — runners are your VMs, not GitHub's. No liability exposure from third-party execution of your deploy keys and secrets.
+2. **Secret management** — GCP Secret Manager with IAM bindings and audit logs vs GitHub's encrypted secrets UI.
+3. **Debugging** — SSH into a running agent VM to diagnose failures. GitHub Actions runners are ephemeral black boxes.
+4. **No vendor lock-in** — pipelines are shell scripts, not YAML actions tied to GitHub's marketplace.
+5. **Cost ceiling** — even at extreme volume, spot instances with scale-to-zero cap your costs. GitHub Actions overage charges are open-ended.
+
 ## How to Add a New Secret to Buildkite Pipelines
 
 ### Self-service (recommended): naming convention
