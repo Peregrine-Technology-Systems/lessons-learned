@@ -642,3 +642,6 @@ Before your first remote build:
 | Disk under 200GB | GCP console performance warnings, slower I/O | Use 200GB minimum for pd-standard |
 | VM deleted with `auto-delete=yes` | Persistent disk destroyed, all cache and results lost | Always set `auto-delete=no` on data disk |
 | Forgot to stop VM | $97/month instead of $12/month | Auto-idle shutdown cron + billing alert at $30 |
+| BuildKit layer cache not busted | Added a package to existing `apt-get install` line but cached layer served | BuildKit caches by RUN command text — same text = cache hit. Use `docker buildx build --no-cache` when changing package lists |
+| `./cloud/dev build` doesn't invalidate Docker cache | Dockerfile changes ignored, old image used | `./cloud/dev build` syncs code but reuses cached layers. Rebuild with `--no-cache` on the VM. Consider adding `./cloud/dev build --no-cache` flag |
+| Pre-commit hooks silently revert changes | Linters revert file edits to old versions, staged content doesn't match intent | Always verify staged content with `git diff --cached` after a hook runs |

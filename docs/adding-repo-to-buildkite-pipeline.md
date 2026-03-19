@@ -162,6 +162,9 @@ In GitHub repo settings (Settings > Branches > Branch protection rules):
 | 5 | Editing environment hook for standard secrets | Unnecessary — auto-discovery handles `{pipeline-slug}--*` pattern without changes |
 | 6 | Missing deploy key for new org/user | Clone fails with `Permission denied (publickey)` — each repo needs its own deploy key |
 | 7 | Upload step missing queue tag | Bootstrap step runs nowhere — add `agent_query_rules` to the initial upload step |
+| 8 | `ghcr.io/cli/cli` Docker image requires auth | `docker pull` fails — GHCR requires authentication even for public images | Use `curl`/`jq` against the GitHub API instead of depending on `gh` CLI in containers |
+| 9 | Using Docker plugin for promotion steps | Unnecessary complexity, image pull issues | Use a shell script (`.buildkite/scripts/promote.sh`) that calls GitHub API directly with curl. Runs on the agent, no Docker plugin needed |
+| 10 | `ruby:3.2.2-slim` missing native compilation deps | `bundle install` fails — no build-essential, no libsqlite3-dev | Use full `ruby:3.2.2` image instead of slim for projects with native gem extensions |
 
 ## Verification Checklist
 
