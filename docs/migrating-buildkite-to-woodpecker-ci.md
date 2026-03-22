@@ -236,6 +236,10 @@ curl -X POST "https://your-server/api/repos/$WP_REPO_ID/secrets" \
 | HCL heredocs eat `${}` in Packer | Use file provisioners for systemd units |
 | SQLite migration fails (v2→v3) | Fix volume permissions: `chmod -R 777` on data dir |
 | Agent can't write `/etc/woodpecker/agent.conf` | Non-fatal — agent still connects, ignore the error |
+| Ghost agent registrations pile up | Ephemeral VMs register on boot, leave orphans on destroy. Prune on scale-to-zero (agents with no contact >1hr). Without pruning, stale queue entries cause exit code -1 on running steps. |
+| Webhook missing `push` event | Woodpecker's auto-created webhook may not include `push`. Verify and add manually: `gh api repos/OWNER/REPO/hooks/ID -X PATCH -f "add_events[]=push"` |
+| API dispatch builds invisible to Woodpecker | Cross-repo triggers via Buildkite API don't create Woodpecker pipelines. Add Woodpecker API trigger: `POST /api/repos/{id}/pipelines` alongside Buildkite dispatch. |
+| Scaler must poll both systems during transition | Buildkite jobs starve if scaler only polls Woodpecker. Combine job counts from both APIs until all projects migrated. |
 
 ## Cost Comparison
 
