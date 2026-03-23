@@ -2,7 +2,7 @@
 
 **Author:** Peregrine Technology Systems
 **Date:** 2026-03-21
-**Status:** In progress — first pipeline migrated, remaining 21 in queue
+**Status:** Complete — Buildkite deprecated across all pipelines (2026-03-22)
 
 ## Why We Moved
 
@@ -240,6 +240,92 @@ curl -X POST "https://your-server/api/repos/$WP_REPO_ID/secrets" \
 | Webhook missing `push` event | Woodpecker's auto-created webhook may not include `push`. Verify and add manually: `gh api repos/OWNER/REPO/hooks/ID -X PATCH -f "add_events[]=push"` |
 | API dispatch builds invisible to Woodpecker | Cross-repo triggers via Buildkite API don't create Woodpecker pipelines. Add Woodpecker API trigger: `POST /api/repos/{id}/pipelines` alongside Buildkite dispatch. |
 | Scaler must poll both systems during transition | Buildkite jobs starve if scaler only polls Woodpecker. Combine job counts from both APIs until all projects migrated. |
+| Queue API ignores dispatched work | `/api/queue/info` `running_count` drops to 0 once steps are dispatched to an agent. Scaler must also count pipelines with `status=running` across all repos to prevent premature scale-down that kills VMs mid-execution. |
+| OAuth2 app can't see org repos | Woodpecker OAuth2 app must be explicitly authorized for the GitHub organization. Go to org settings → Third-party access → Authorize. |
+| Shared bundler cache masks failures | Buildkite's shared `/tmp/bundler-cache` volume leaks gems between projects. Clean Docker containers in Woodpecker expose pre-existing failures (missing gems, stale state). |
+| Cross-project IAM not set up | Agent SA needs explicit IAM grants (e.g., `roles/run.developer`) in every GCP project it deploys to. Audit before migrating deploy steps. |
+| Spec files reference old script paths | Tests that validate `.buildkite/scripts/` content need path updates to `scripts/woodpecker/`. |
+
+## Batch Migration Lessons (2026-03-22)
+
+We migrated the remaining projects (peregrine-penetrator-backend, peregrine-penetrator-reporter, peregrine-penetrator-scanner) in a single session. Key lessons from the batch cutover:
+
+### Design for project independence
+
+Each project should own its entire CI pipeline — `.woodpecker/*.yaml` configs and `scripts/woodpecker/*.sh` scripts — with zero dependencies on the ci-infrastructure repo. The only shared dependency is "a Woodpecker agent with Docker on it." This means:
+
+- **No shared environment hook.** Buildkite's 146-line environment hook injected secrets, set up SSH keys, and routed deploy targets. With Woodpecker, each repo declares its own secrets via `from_secret:` and handles setup in its own scripts.
+- **No GCS hooks bucket.** The self-refresh-from-GCS pattern is gone entirely.
+- **Language runtimes via Docker.** Ruby projects run tests via `docker run ruby:3.2.2` because the agent image doesn't have Ruby. This keeps projects independent of the Packer image contents.
+
+### Consistent structure across projects
+
+All projects use the same directory layout regardless of complexity:
+
+```
+.woodpecker/
+  ci.yaml              # Test + Lint (all branches except main)
+  promote.yaml         # Branch promotion (development→staging, staging→main)
+  sync-back.yaml       # Sync RELEASE_NOTES.md after tag
+
+scripts/woodpecker/
+  test.sh              # Language-specific test runner
+  lint.sh              # Language-specific linter
+  promote.sh           # GitHub API PR creation + auto-merge
+  sync-back.sh         # Version file sync back to dev/staging
+  notify-slack.sh      # Pipeline failure notification
+```
+
+Projects with Docker builds add `build.yaml`, `deploy.yaml`, `smoke-test.yaml`. The pattern scales without divergence.
+
+### Shared caches mask failures
+
+Buildkite's Docker plugin used a shared `/tmp/bundler-cache` volume across all projects. This meant gems installed by one project leaked into another's environment. When we moved to clean Docker containers per run, several pre-existing failures surfaced:
+
+- `.rubocop.yml` requiring `rubocop-rails` when the gem wasn't in the Gemfile (worked because another project's cache had it)
+- Test failures in services that passed only due to stale cached state
+
+**Lesson:** Clean CI environments are a feature, not a bug. The failures were always there — Buildkite just hid them.
+
+### OAuth2 app needs org authorization
+
+When activating org repos, the Woodpecker OAuth2 app must be explicitly authorized for the GitHub organization. Personal repos work immediately, but org repos return `Could not fetch repository from forge` until the org grants access.
+
+**Fix:** GitHub → Organization Settings → Third-party access → Authorize the OAuth app.
+
+### Cross-project IAM surfaces during migration
+
+Buildkite's environment hook ran `gcloud auth` with project-specific credentials. With Woodpecker's local backend, all steps run as the agent VM's service account. Cross-project operations (e.g., deploying Cloud Run in `peregrine-pentest-dev` from an agent in `ci-runners-de`) require explicit IAM grants that may not have existed before.
+
+**Gotcha:** Audit cross-project IAM before migrating deploy steps. The CI agent SA needs permissions in every GCP project it deploys to.
+
+### Promotion scripts adapt cleanly
+
+The GitHub API promotion pattern (create PR, auto-merge or assign reviewer) ports directly from Buildkite to Woodpecker. The only change is environment variable names:
+
+| Buildkite | Woodpecker |
+|-----------|------------|
+| `BUILDKITE_BRANCH` | `CI_COMMIT_BRANCH` |
+| `BUILDKITE_COMMIT` | `CI_COMMIT_SHA` |
+| `BUILDKITE_BUILD_URL` | Construct from `CI_REPO_ID` + `CI_PIPELINE_NUMBER` |
+
+### Spec files that test CI scripts need path updates
+
+If your test suite validates CI script contents (e.g., checking that `promote.sh` includes `requested_reviewers`), the file paths in those specs must be updated from `.buildkite/scripts/` to `scripts/woodpecker/`. We missed this initially, causing 8 spurious test failures.
+
+## Buildkite Deprecation
+
+As of 2026-03-22, Buildkite is fully deprecated across all Peregrine Technology Systems pipelines. All CI/CD runs on self-hosted Woodpecker CI.
+
+**What was removed:**
+- `.buildkite/` directories from all project repos
+- GitHub Actions CI workflows (replaced by Woodpecker)
+- Buildkite environment hook and GCS hooks bucket dependency
+
+**What remains (cleanup pending):**
+- Buildkite agent binary in Packer image (remove after confirming all projects stable)
+- Buildkite API token in GCP Secret Manager (delete after subscription cancellation)
+- Buildkite subscription (cancel)
 
 ## Cost Comparison
 
@@ -253,20 +339,23 @@ curl -X POST "https://your-server/api/repos/$WP_REPO_ID/secrets" \
 ## Migration Checklist
 
 Per project:
-- [ ] Create `.woodpecker/*.yaml` pipeline files
-- [ ] Create wrapper scripts in `scripts/woodpecker/` (if reusing Buildkite scripts)
-- [ ] Activate repo in Woodpecker UI/API
-- [ ] Add secrets (deploy keys, target hosts)
-- [ ] Verify: push triggers build → deploy → validate
-- [ ] Remove `.buildkite/` directory
+- [x] Create `.woodpecker/*.yaml` pipeline files
+- [x] Create self-contained scripts in `scripts/woodpecker/`
+- [x] Activate repo in Woodpecker UI/API
+- [x] Add secrets (deploy keys, target hosts, Slack webhook)
+- [x] Verify: push triggers build → deploy → validate
+- [x] Remove `.buildkite/` directory
 - [ ] Deactivate pipeline in Buildkite
 
 Infrastructure (once):
-- [ ] Deploy Woodpecker server on DO droplet
-- [ ] Create GitHub OAuth2 App
-- [ ] Add Woodpecker agent to Packer image
-- [ ] Store agent config in GCP Secret Manager
-- [ ] Adapt custom scaler to poll Woodpecker API
+- [x] Deploy Woodpecker server on DO droplet
+- [x] Create GitHub OAuth2 App
+- [x] Authorize OAuth2 App for GitHub organization
+- [x] Add Woodpecker agent to Packer image
+- [x] Store agent config in GCP Secret Manager
+- [x] Adapt custom scaler to poll Woodpecker API
+- [ ] Remove Buildkite agent from Packer image
+- [ ] Delete Buildkite API token from Secret Manager
 - [ ] Cancel Buildkite subscription
 
 ## Related Resources
