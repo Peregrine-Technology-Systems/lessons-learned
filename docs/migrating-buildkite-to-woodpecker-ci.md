@@ -258,6 +258,7 @@ curl -X POST "https://your-server/api/repos/$WP_REPO_ID/secrets" \
 | `MAX_WORKFLOWS=1` serializes parallel steps | With `backend: local`, parallel steps within a workflow run **sequentially**, not concurrently. For true parallelism, use separate workflows (1 shard per workflow). The scaler spins up 1 VM per workflow. Generate with `ci-infrastructure/scripts/generate-ci-shards.sh`. |
 | No server-side pipeline timeout by default | Woodpecker's default timeout is 60 minutes — far too long for most workloads. Set `WOODPECKER_TIMEOUT=5m` (or appropriate) in the server `.env`. Without this, stuck pipelines hang forever. |
 | Coverage fails per-shard | Each shard only exercises a subset of the source code, so individual shard coverage always fails global thresholds. Collect coverage JSON per-shard, merge with `nyc merge` in a final workflow, then check thresholds against the merged result. |
+| YAML `---` multi-document ignored | Woodpecker v3.13 does NOT parse `---` multi-document YAML separators in a single `.yaml` file — only the first document runs. For multiple workflows, use **separate files** in `.woodpecker/` (e.g., `ci.yaml`, `ci-shard-2.yaml`, `ci-shard-3.yaml`). Each file becomes a separate workflow dispatched to a separate agent. |
 
 ## Batch Migration Lessons (2026-03-22)
 
