@@ -2,7 +2,7 @@
 
 **Author:** Peregrine Technology Systems
 **Date:** 2026-03-21
-**Status:** In progress — first pipeline migrated, remaining 21 in queue
+**Status:** Complete — Buildkite deprecated across all pipelines (2026-03-22)
 
 ## Why We Moved
 
@@ -236,10 +236,155 @@ curl -X POST "https://your-server/api/repos/$WP_REPO_ID/secrets" \
 | HCL heredocs eat `${}` in Packer | Use file provisioners for systemd units |
 | SQLite migration fails (v2→v3) | Fix volume permissions: `chmod -R 777` on data dir |
 | Agent can't write `/etc/woodpecker/agent.conf` | Non-fatal — agent still connects, ignore the error |
-| Ghost agent registrations pile up | Ephemeral VMs register on boot, leave orphans on destroy. Prune on scale-to-zero (agents with no contact >1hr). Without pruning, stale queue entries cause exit code -1 on running steps. |
+| Ghost agent registrations pile up | Ephemeral VMs register on boot, leave orphans on destroy. Prune only when: queue is healthy, no active pipelines, and agent has no assigned tasks. Without pruning, stale entries accumulate; with unsafe pruning, queue API breaks (#87). |
 | Webhook missing `push` event | Woodpecker's auto-created webhook may not include `push`. Verify and add manually: `gh api repos/OWNER/REPO/hooks/ID -X PATCH -f "add_events[]=push"` |
 | API dispatch builds invisible to Woodpecker | Cross-repo triggers via Buildkite API don't create Woodpecker pipelines. Add Woodpecker API trigger: `POST /api/repos/{id}/pipelines` alongside Buildkite dispatch. |
 | Scaler must poll both systems during transition | Buildkite jobs starve if scaler only polls Woodpecker. Combine job counts from both APIs until all projects migrated. |
+| Queue API ignores dispatched work | `/api/queue/info` `running_count` drops to 0 once steps are dispatched to an agent. Scaler must also count pipelines with `status=running` across all repos to prevent premature scale-down that kills VMs mid-execution. |
+| OAuth2 app can't see org repos | Woodpecker OAuth2 app must be explicitly authorized for the GitHub organization. Go to org settings → Third-party access → Authorize. |
+| Shared bundler cache masks failures | Buildkite's shared `/tmp/bundler-cache` volume leaks gems between projects. Clean Docker containers in Woodpecker expose pre-existing failures (missing gems, stale state). |
+| Cross-project IAM not set up | Agent SA needs explicit IAM grants (e.g., `roles/run.developer`) in every GCP project it deploys to. Audit before migrating deploy steps. |
+| Spec files reference old script paths | Tests that validate `.buildkite/scripts/` content need path updates to `scripts/woodpecker/`. |
+| Shallow clone breaks git rev-list | Woodpecker clones `--depth 1 --single-branch`. `git fetch origin staging` + `git rev-list` fails silently. Use GitHub Compare API (`GET /repos/{owner}/{repo}/compare/{base}...{head}`) instead. |
+| `branch: exclude` blocks ALL workflows | If `ci.yaml` excludes `main`, Woodpecker filters the entire push event — `version-bump.yaml` and `deploy.yaml` never trigger even if they include `main`. Fix: remove `depends_on: ci` from workflows that run on main. |
+| Docker build needs full clone depth | Default `--depth 1` means `COPY . .` gets the code but tags are missing. Set `depth: 0` in clone settings for build and version-bump workflows. |
+| `git push` fails in Woodpecker | HTTPS clone has no push credentials. Set `git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"` before pushing. Affects version-bump and sync-back scripts. |
+| Version-bump infinite loop | version-bump pushes a commit to main, which triggers another pipeline, which bumps again. Guard: check `CI_COMMIT_MESSAGE` — if it starts with `release: v`, exit immediately. Critical: without this guard, versions increment uncontrollably. |
+| Clone step hits GitHub API every run | Local backend downloads `plugin-git` binary from GitHub on every clone. Cloud NAT timeouts cause `setup clone step failed: i/o timeout`. Fix: pre-install `plugin-git` in the Packer image (`/usr/local/bin/plugin-git`). The agent's `loadClone()` finds it via `LookPath` at startup and skips the download. |
+| Queue API 500 deadlocks scaler | Orphaned task assignment (agent destroyed) breaks `/api/queue/info`. Scaler defaults to no demand, never scales up. Fix: fall through to pipeline status check, circuit breaker auto-cancels stuck pipelines after 5 failures (#87). |
+| Agent pruning breaks queue | Deleting agent registration while task is assigned causes "agent not found" errors. Fix: check queue task assignments before pruning, skip when work is active (#87). |
+| `/healthz` lies about server health | Returns 204 while queue API is broken. Fix: deep health check cron tests queue API directly, restarts container on failure (#87). |
+| gRPC disconnect causes stuck pipelines | Server 502 drops agent gRPC connection. Server thinks pipeline is "running" but agent is idle (load 0.00). Three defences: (1) `WOODPECKER_TIMEOUT=5m` in server .env, (2) scaler `cancel_stale_pipelines()` at 10 min, (3) agent watchdog restarts agent after 30s of idle + gRPC errors (#156). |
+| `MAX_WORKFLOWS=1` serializes parallel steps | With `backend: local`, parallel steps within a workflow run **sequentially**, not concurrently. For true parallelism, use separate workflows (1 shard per workflow). The scaler spins up 1 VM per workflow. Generate with `ci-infrastructure/scripts/generate-ci-shards.sh`. |
+| No server-side pipeline timeout by default | Woodpecker's default timeout is 60 minutes — far too long for most workloads. Set `WOODPECKER_TIMEOUT=5m` (or appropriate) in the server `.env`. Without this, stuck pipelines hang forever. |
+| Coverage fails per-shard | Each shard only exercises a subset of the source code, so individual shard coverage always fails global thresholds. Collect coverage JSON per-shard, merge with `nyc merge` in a final workflow, then check thresholds against the merged result. |
+
+## Batch Migration Lessons (2026-03-22)
+
+We migrated the remaining projects (peregrine-penetrator-backend, peregrine-penetrator-reporter, peregrine-penetrator-scanner) in a single session. Key lessons from the batch cutover:
+
+### Design for project independence
+
+Each project should own its entire CI pipeline — `.woodpecker/*.yaml` configs and `scripts/woodpecker/*.sh` scripts — with zero dependencies on the ci-infrastructure repo. The only shared dependency is "a Woodpecker agent with Docker on it." This means:
+
+- **No shared environment hook.** Buildkite's 146-line environment hook injected secrets, set up SSH keys, and routed deploy targets. With Woodpecker, each repo declares its own secrets via `from_secret:` and handles setup in its own scripts.
+- **No GCS hooks bucket.** The self-refresh-from-GCS pattern is gone entirely.
+- **Language runtimes via Docker.** Ruby projects run tests via `docker run ruby:3.2.2` because the agent image doesn't have Ruby. This keeps projects independent of the Packer image contents.
+
+### Consistent structure across projects
+
+All projects use the same directory layout regardless of complexity:
+
+```
+.woodpecker/
+  ci.yaml              # Test + Lint (all branches except main)
+  promote.yaml         # Branch promotion (development→staging, staging→main)
+  sync-back.yaml       # Sync RELEASE_NOTES.md after tag
+
+scripts/woodpecker/
+  test.sh              # Language-specific test runner
+  lint.sh              # Language-specific linter
+  promote.sh           # GitHub API PR creation + auto-merge
+  sync-back.sh         # Version file sync back to dev/staging
+  notify-slack.sh      # Pipeline failure notification
+```
+
+Projects with Docker builds add `build.yaml`, `deploy.yaml`, `smoke-test.yaml`. The pattern scales without divergence.
+
+### Shared caches mask failures
+
+Buildkite's Docker plugin used a shared `/tmp/bundler-cache` volume across all projects. This meant gems installed by one project leaked into another's environment. When we moved to clean Docker containers per run, several pre-existing failures surfaced:
+
+- `.rubocop.yml` requiring `rubocop-rails` when the gem wasn't in the Gemfile (worked because another project's cache had it)
+- Test failures in services that passed only due to stale cached state
+
+**Lesson:** Clean CI environments are a feature, not a bug. The failures were always there — Buildkite just hid them.
+
+### OAuth2 app needs org authorization
+
+When activating org repos, the Woodpecker OAuth2 app must be explicitly authorized for the GitHub organization. Personal repos work immediately, but org repos return `Could not fetch repository from forge` until the org grants access.
+
+**Fix:** GitHub → Organization Settings → Third-party access → Authorize the OAuth app.
+
+### Cross-project IAM surfaces during migration
+
+Buildkite's environment hook ran `gcloud auth` with project-specific credentials. With Woodpecker's local backend, all steps run as the agent VM's service account. Cross-project operations (e.g., deploying Cloud Run in `peregrine-pentest-dev` from an agent in `ci-runners-de`) require explicit IAM grants that may not have existed before.
+
+**Gotcha:** Audit cross-project IAM before migrating deploy steps. The CI agent SA needs permissions in every GCP project it deploys to.
+
+### Promotion scripts adapt cleanly
+
+The GitHub API promotion pattern (create PR, auto-merge or assign reviewer) ports directly from Buildkite to Woodpecker. The only change is environment variable names:
+
+| Buildkite | Woodpecker |
+|-----------|------------|
+| `BUILDKITE_BRANCH` | `CI_COMMIT_BRANCH` |
+| `BUILDKITE_COMMIT` | `CI_COMMIT_SHA` |
+| `BUILDKITE_BUILD_URL` | Construct from `CI_REPO_ID` + `CI_PIPELINE_NUMBER` |
+
+### Spec files that test CI scripts need path updates
+
+If your test suite validates CI script contents (e.g., checking that `promote.sh` includes `requested_reviewers`), the file paths in those specs must be updated from `.buildkite/scripts/` to `scripts/woodpecker/`. We missed this initially, causing 8 spurious test failures.
+
+## Production Stability Lessons (2026-03-25)
+
+### Queue API deadlock — the scaler's blind spot
+
+**Incident:** Pipeline #121 (uscgaux-website-checker version-bump) stuck for hours. MIG at 0, scaler running every 60s, but no agents ever spun up.
+
+**Root cause:** Woodpecker assigned the task to an agent registration that no longer existed (MIG scaled to zero and destroyed the VM). The `/api/queue/info` endpoint then returned HTTP 500 (`agent not found for task 893`) on every call. The scaler caught the error and defaulted to `waiting=0, running=0` — creating a deadlock where it never saw demand and never scaled up.
+
+**Contributing factor:** Agent pruning deleted the stale agent registration, but the task reference in the queue still pointed to it. Pruning during or just before active work is dangerous.
+
+**Gotcha: `/healthz` lies.** The server returned HTTP 204 on `/healthz` while the queue API was completely broken. Health checks must test the queue API, not just the health endpoint.
+
+**Fix — three layers of failsafes:**
+
+1. **Scaler: Never go blind.** When the queue API errors, fall through to pipeline status check (`_count_active_pipelines()`) instead of returning `(0, 0)`. The pipeline status API is independent and unaffected by the queue bug.
+
+2. **Scaler: Safe agent pruning.** Only prune when (a) queue API is healthy, (b) no pending/running pipelines, and (c) the agent has no tasks assigned in the queue's `running` list.
+
+3. **Scaler: Circuit breaker.** Track consecutive queue API failures in GCS state. After 5 failures (~5 minutes), auto-cancel the oldest stuck pipeline (status=running, started_at=null). This clears the queue corruption and restores the API. Slack notification on every auto-cancel.
+
+4. **Droplet: Deep health check cron.** Every 14 minutes, test `/api/queue/info` (not `/healthz`). If the queue API returns non-200, restart the Woodpecker server container. Rate-limited to once per 15 minutes.
+
+5. **Dead man's switch (healthchecks.io).** The scaler Cloud Function pings healthchecks.io on every invocation (every 60s). If the queue API is unhealthy, it pings `/fail`. Healthchecks.io expects a ping every 15 minutes — silence triggers an alert. This monitors the full chain: Cloud Scheduler → Cloud Function → Woodpecker API.
+
+| Gotcha | Solution |
+|--------|----------|
+| Queue API 500 on orphaned task | Circuit breaker auto-cancels stuck pipeline after 5 failures |
+| Scaler defaults to (0,0) on error | Fall through to pipeline status API (independent of queue) |
+| Agent pruning breaks queue | Skip pruning when work is active or queue is unhealthy |
+| `/healthz` returns 204 while queue broken | Deep health check tests queue API directly |
+| Scaler or scheduler stops running | healthchecks.io dead man's switch — scaler pings every 60s, alert after 15 min silence |
+| Need to monitor full chain | Ping from scaler (not droplet) monitors: Scheduler → Cloud Function → Woodpecker API |
+| MIG target > 0 but 0 instances | GCP spot capacity exhaustion. Scaler says "already at N" but no VMs exist. Red Slack alert after 2 consecutive checks (~2 min). Repeat every 10 min. Fix: wait for spot, switch to on-demand, or multi-region failover (#90). |
+
+### Spot VM capacity exhaustion (2026-03-25)
+
+**Incident:** All pipelines blocked for 20+ minutes. Scaler correctly set MIG target=3 but GCP couldn't create any VMs in us-central1 — `resource_availability` error with `zonesAvailable: ""` across all zones.
+
+**Silent failure:** The scaler reported "MIG already at 3" every 60s because `get_mig_size()` returns the *target* size, not actual running instances. From the scaler's perspective, everything was fine. No alert was sent.
+
+**Gotcha: MIG target size != running instances.** The Compute API's `targetSize` is what you *asked for*, not what you *got*. When spot capacity is exhausted, GCP silently fails to create VMs. The MIG shows target=3 but 0 instances exist.
+
+**Fix:** Scaler now compares target size to actual running instance count (`listManagedInstances` API). If target > 0 but 0 instances are running for 2+ consecutive checks, sends a `:red_circle:` Slack alert with the region and likely cause. Repeats every 10 minutes during sustained outage.
+
+**Multi-region failover** (backlog #90): The MIG is currently single-region (us-central1). When the entire region is out of spot capacity, there's no automated fallback. Plan: scaler detects creation failures and tries secondary regions (us-east1, us-west1).
+
+## Buildkite Deprecation
+
+As of 2026-03-22, Buildkite is fully deprecated across all Peregrine Technology Systems pipelines. All CI/CD runs on self-hosted Woodpecker CI.
+
+**What was removed:**
+- `.buildkite/` directories from all project repos
+- GitHub Actions CI workflows (replaced by Woodpecker)
+- Buildkite environment hook and GCS hooks bucket dependency
+
+**What remains (cleanup pending):**
+- Buildkite agent binary in Packer image (remove after confirming all projects stable)
+- Buildkite API token in GCP Secret Manager (delete after subscription cancellation)
+- Buildkite subscription (cancel)
 
 ## Cost Comparison
 
@@ -253,20 +398,23 @@ curl -X POST "https://your-server/api/repos/$WP_REPO_ID/secrets" \
 ## Migration Checklist
 
 Per project:
-- [ ] Create `.woodpecker/*.yaml` pipeline files
-- [ ] Create wrapper scripts in `scripts/woodpecker/` (if reusing Buildkite scripts)
-- [ ] Activate repo in Woodpecker UI/API
-- [ ] Add secrets (deploy keys, target hosts)
-- [ ] Verify: push triggers build → deploy → validate
-- [ ] Remove `.buildkite/` directory
+- [x] Create `.woodpecker/*.yaml` pipeline files
+- [x] Create self-contained scripts in `scripts/woodpecker/`
+- [x] Activate repo in Woodpecker UI/API
+- [x] Add secrets (deploy keys, target hosts, Slack webhook)
+- [x] Verify: push triggers build → deploy → validate
+- [x] Remove `.buildkite/` directory
 - [ ] Deactivate pipeline in Buildkite
 
 Infrastructure (once):
-- [ ] Deploy Woodpecker server on DO droplet
-- [ ] Create GitHub OAuth2 App
-- [ ] Add Woodpecker agent to Packer image
-- [ ] Store agent config in GCP Secret Manager
-- [ ] Adapt custom scaler to poll Woodpecker API
+- [x] Deploy Woodpecker server on DO droplet
+- [x] Create GitHub OAuth2 App
+- [x] Authorize OAuth2 App for GitHub organization
+- [x] Add Woodpecker agent to Packer image
+- [x] Store agent config in GCP Secret Manager
+- [x] Adapt custom scaler to poll Woodpecker API
+- [ ] Remove Buildkite agent from Packer image
+- [ ] Delete Buildkite API token from Secret Manager
 - [ ] Cancel Buildkite subscription
 
 ## Related Resources
