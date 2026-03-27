@@ -259,6 +259,8 @@ curl -X POST "https://your-server/api/repos/$WP_REPO_ID/secrets" \
 | No server-side pipeline timeout by default | Woodpecker's default timeout is 60 minutes — far too long for most workloads. Set `WOODPECKER_TIMEOUT=5m` (or appropriate) in the server `.env`. Without this, stuck pipelines hang forever. |
 | Coverage fails per-shard | Each shard only exercises a subset of the source code, so individual shard coverage always fails global thresholds. Collect coverage JSON per-shard, merge with `nyc merge` in a final workflow, then check thresholds against the merged result. |
 | YAML `---` multi-document ignored | Woodpecker v3.13 does NOT parse `---` multi-document YAML separators in a single `.yaml` file — only the first document runs. For multiple workflows, use **separate files** in `.woodpecker/` (e.g., `ci.yaml`, `ci-shard-2.yaml`, `ci-shard-3.yaml`). Each file becomes a separate workflow dispatched to a separate agent. |
+| Crons created disabled by default | The Woodpecker API creates crons with `enabled: false` regardless of what you pass. PATCH also ignores the `enabled` field. Workaround: pass `"enabled": true` in the POST body at creation time. If the cron is already disabled, delete it and recreate with `enabled: true`. The UI toggle also works but isn't scriptable. |
+| CI auto-commit PDFs cause merge conflicts | Auto-committing generated PDFs to feature branches creates binary merge conflicts when multiple PRs are open. Fix: build and commit PDFs on main only (post-merge workflow), never on feature branches. PDFs are derived artifacts — source is markdown. Developers run `make` locally for preview (#210). |
 
 ## Batch Migration Lessons (2026-03-22)
 
@@ -309,7 +311,7 @@ When activating org repos, the Woodpecker OAuth2 app must be explicitly authoriz
 
 ### Cross-project IAM surfaces during migration
 
-Buildkite's environment hook ran `gcloud auth` with project-specific credentials. With Woodpecker's local backend, all steps run as the agent VM's service account. Cross-project operations (e.g., deploying Cloud Run in `peregrine-pentest-dev` from an agent in `ci-runners-de`) require explicit IAM grants that may not have existed before.
+Buildkite's environment hook ran `gcloud auth` with project-specific credentials. With Woodpecker's local backend, all steps run as the agent VM's service account. Cross-project operations (e.g., deploying Cloud Run in `project-b` from an agent in `project-a`) require explicit IAM grants that may not have existed before.
 
 **Gotcha:** Audit cross-project IAM before migrating deploy steps. The CI agent SA needs permissions in every GCP project it deploys to.
 
