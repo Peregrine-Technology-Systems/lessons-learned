@@ -13,6 +13,7 @@ These guides are written to be useful for both humans and AI coding assistants w
 | [Adding a New Repo to GCP-Based Buildkite Pipeline](docs/adding-repo-to-buildkite-pipeline.md) | Per-repo onboarding to existing Buildkite + GCP infrastructure, including secrets, deploy keys, webhooks, and 7 documented gotchas |
 | [Develop-Canonical PDF Generation Pattern](docs/develop-canonical-pdf-generation.md) | Auto-generate doc PDFs on feature branches only, track in git, flow forward via promotions without binary merge conflicts, and 6 documented gotchas |
 | [Ruby + Sinatra + Docker on GCP Cloud Run](docs/ruby-sinatra-docker-cloud-run.md) | Baked base image pattern (45x faster builds), Sinatra 4 host authorization, Cloud Run IAM vs app auth, cross-project registry, version-bump PR flow, and 8 documented gotchas |
+| [Automated Branch Promotion Pipeline](docs/automated-branch-promotion-pipeline.md) | Three-branch Git flow with conflict-free automated promotions, always-local merge branches (GitHub API ignores .gitattributes), cascade guards, shallow clone pitfalls, and 7 documented learnings |
 
 ## Contributing
 
